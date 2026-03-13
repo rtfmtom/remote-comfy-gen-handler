@@ -8,6 +8,7 @@ Files are downloaded to /runpod-volume/ComfyUI/models/<dest>/.
 """
 
 import os
+import re
 import subprocess
 import time
 
@@ -79,13 +80,43 @@ def _download_civitai(version_id: str, dest_dir: str) -> dict:
     }
 
 
-def _download_url(url: str, dest_dir: str, filename: str | None = None) -> dict:
-    """Download a file from a direct URL using aria2c.
+def _parse_aria2c_progress(line: str) -> tuple[float, str] | None:
+    """Parse aria2c progress from a summary line.
+
+    aria2c prints lines like:
+      [#abc123 1.2GiB/3.5GiB(34%) CN:8 DL:52MiB]
+      [#abc123 45MiB/3.5GiB(1%) CN:1 DL:12MiB]
+
+    Returns (percent, speed_str) or None if not a progress line.
+    """
+    m = re.search(r'\((\d+)%\)', line)
+    if not m:
+        return None
+    pct = int(m.group(1))
+    speed = ""
+    s = re.search(r'DL:([^\s\]]+)', line)
+    if s:
+        speed = s.group(1)
+    return (pct, speed)
+
+
+def _download_url(
+    url: str,
+    dest_dir: str,
+    filename: str | None = None,
+    job: dict | None = None,
+    item_index: int = 0,
+    total_items: int = 1,
+) -> dict:
+    """Download a file from a direct URL using aria2c with progress streaming.
 
     Args:
         url: Direct download URL.
         dest_dir: Absolute path to destination directory.
         filename: Output filename. If None, derived from URL.
+        job: RunPod job dict for progress updates.
+        item_index: Current download index (0-based) for progress calculation.
+        total_items: Total number of downloads in this batch.
 
     Returns:
         Dict with filename, path, size_mb.
@@ -98,17 +129,52 @@ def _download_url(url: str, dest_dir: str, filename: str | None = None) -> dict:
         if "?" in filename:
             filename = filename.split("?")[0]
 
-    result = subprocess.run(
-        ["aria2c", "-d", dest_dir, "-o", filename, "--allow-overwrite=true", url],
-        capture_output=True,
+    # Stream aria2c output to capture real-time progress
+    proc = subprocess.Popen(
+        [
+            "aria2c", "-d", dest_dir, "-o", filename,
+            "--allow-overwrite=true",
+            "--summary-interval=3",
+            "--console-log-level=notice",
+            url,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=600,
     )
 
-    if result.returncode != 0:
+    output_lines = []
+    last_progress_time = 0
+    try:
+        for line in proc.stdout:
+            output_lines.append(line)
+            parsed = _parse_aria2c_progress(line)
+            if parsed and job:
+                dl_pct, speed = parsed
+                now = time.time()
+                # Throttle progress updates to every 3 seconds
+                if now - last_progress_time >= 3:
+                    last_progress_time = now
+                    # Map download progress into the overall batch progress
+                    base_pct = (item_index / total_items) * 100
+                    item_pct = (dl_pct / 100) * (100 / total_items)
+                    overall_pct = base_pct + item_pct
+                    speed_str = f" ({speed}/s)" if speed else ""
+                    _send_progress(
+                        job,
+                        f"Downloading {item_index+1}/{total_items}: "
+                        f"{filename} {dl_pct}%{speed_str}",
+                        percent=overall_pct,
+                    )
+    except Exception:
+        pass
+
+    proc.wait(timeout=600)
+
+    if proc.returncode != 0:
+        full_output = "".join(output_lines).strip()
         raise RuntimeError(
-            f"aria2c download failed (exit {result.returncode}): "
-            f"{result.stderr.strip() or result.stdout.strip()}"
+            f"aria2c download failed (exit {proc.returncode}): {full_output}"
         )
 
     filepath = os.path.join(dest_dir, filename)
@@ -181,7 +247,10 @@ def handle(job: dict) -> dict:
                 raise RuntimeError(f"Download {i+1}: 'url' required for url source")
             filename = dl.get("filename")
             print(f"[job {job_id[:8]}] URL download: {url} -> {dest}")
-            info = _download_url(url, dest_dir, filename)
+            info = _download_url(
+                url, dest_dir, filename,
+                job=job, item_index=i, total_items=len(downloads),
+            )
 
         else:
             raise RuntimeError(f"Download {i+1}: unknown source '{source}'. Use 'civitai' or 'url'.")
