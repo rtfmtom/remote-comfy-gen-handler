@@ -357,10 +357,14 @@ def handler(job: dict) -> dict:
     """
     job_input = job["input"]
 
-    # Dispatch download commands to separate handler
-    if job_input.get("command") == "download":
+    # Dispatch non-workflow commands to separate handlers
+    command = job_input.get("command")
+    if command == "download":
         import download_handler
         return download_handler.handle(job)
+    if command == "list_models":
+        import list_handler
+        return list_handler.handle(job)
 
     start_time = time.time()
     job_id = job.get("id", "unknown")
