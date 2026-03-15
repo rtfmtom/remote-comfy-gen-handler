@@ -46,7 +46,7 @@ def _download_civitai(version_id: str, dest_dir: str) -> dict:
     before = set(os.listdir(dest_dir)) if os.path.isdir(dest_dir) else set()
 
     result = subprocess.run(
-        ["python3", CIVITAI_SCRIPT, "-v", str(version_id), "-o", dest_dir],
+        ["python3", CIVITAI_SCRIPT, "-m", str(version_id), "-o", dest_dir],
         capture_output=True,
         text=True,
         timeout=600,
